@@ -3,3 +3,5 @@ __pycache__/
 .env
 .env.*
 output/
+tts-routes.json
+tts-routes.sqlite3*

@@ -1,0 +1,28 @@
+Write a short listening lesson for a language learner.
+
+Topic: {{topic}}
+Language: {{language}}
+CEFR level: {{level}}
+
+If no topic is supplied, choose one useful, concrete topic at that level. Do not ask me to choose. Put the topic in the lesson title.
+
+Return only one valid JSON object, with no Markdown and no explanation. Use exactly this structure:
+
+{
+  "title": "Short title in the target language",
+  "language": "{{language}}",
+  "level": "{{level}}",
+  "turns": [
+    {"speaker": "anna", "text": "One spoken sentence in the target language.", "delivery": "Curious and friendly", "pause_ms": 400},
+    {"speaker": "ben", "text": "The next spoken sentence in the target language.", "delivery": "Warm and reassuring", "pause_ms": 500}
+  ]
+}
+
+Rules:
+- Write a coherent story, narration, or dialogue, usually 8 to 12 turns. Use natural words and grammar at the requested level.
+- Use one sentence per turn. Keep spoken text at 120 characters or fewer. Never put speaker names, stage directions, or markup in the spoken text.
+- Use only these speaker IDs: anna, ben, maya, martin. Use at most two distinct speakers in the entire lesson. Use martin for narration, or use two other speakers for dialogue. If combining narration and dialogue, use martin and one other speaker.
+- For each turn, put a short English emotion or delivery direction in "delivery", up to 120 characters.
+- Use an integer "pause_ms" between 0 and 3000. Around 400–650 usually works well.
+- Keep the title at 64 characters or fewer. Use the requested language code and CEFR level exactly.
+- Use straight double quotes for JSON keys and strings. Do not include comments, trailing commas, or extra keys.

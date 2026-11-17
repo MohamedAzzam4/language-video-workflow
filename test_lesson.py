@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -87,6 +88,51 @@ class LessonTests(unittest.TestCase):
         self.assertEqual(adjusted, [(0, rate), (rate * 14 // 10, rate * 23 // 10)])
         self.assertEqual(rendered.replace(b"\x00\x00", b""), pcm)
 
+    def test_openrouter_writes_script_but_gemini_keeps_voice_and_key(self):
+        story = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        script = {"choices": [{"message": {"content": json.dumps(story)}}]}
+        audio = {"steps": [{"type": "model_output", "content": [{
+            "type": "audio", "data": base64.b64encode(lesson.tone_wav("anna")).decode(),
+        }]}]}
+        free_model = "openai/gpt-oss-20b:free"
+        responses = [io.BytesIO(json.dumps(result).encode("utf-8")) for result in (script, audio)]
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            args = ["lesson.py", "--topic", "At the café", "--mode", "dialogue", "--turns", "4",
+                    "--openrouter-text-model", free_model, "--gemini-key-env", "GOOGLE_AI_API_KEY2",
+                    "--output", str(output)]
+            env = {"OPENROUTER_API_KEY": "fake-router", "GOOGLE_AI_API_KEY2": "fake-google"}
+            with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", args), \
+                    patch.object(lesson.shutil, "which", return_value="ffmpeg"), \
+                    patch.object(lesson, "urlopen", side_effect=responses) as call, \
+                    patch.object(lesson, "render", side_effect=lambda s, o, k, m, _, routes=None:
+                                 lesson.speech_track(s, o, k, m, routes=routes)[0]):
+                lesson.main()
+            self.assertEqual(call.call_count, 2)
+            writer, speaker = [invocation.args[0] for invocation in call.call_args_list]
+            self.assertEqual(writer.full_url, lesson.OPENROUTER_API)
+            self.assertEqual(writer.get_header("Authorization"), "Bearer fake-router")
+            self.assertIsNone(writer.get_header("X-goog-api-key"))
+            written = json.loads(writer.data)
+            self.assertEqual(written["model"], free_model)
+            self.assertEqual(written["provider"], {"require_parameters": True})
+            self.assertEqual(written["response_format"]["type"], "json_schema")
+            self.assertNotIn("models", written)
+            self.assertEqual(speaker.full_url, lesson.API)
+            self.assertEqual(speaker.get_header("X-goog-api-key"), "fake-google")
+            self.assertIsNone(speaker.get_header("Authorization"))
+            spoken = json.loads(speaker.data)
+            self.assertEqual(spoken["model"], lesson.TTS_MODEL)
+            self.assertEqual(spoken["generation_config"]["speech_config"]["speakers"],
+                             [{"speaker": "anna", "voice": "Kore"}, {"speaker": "ben", "voice": "Puck"}])
+
+    def test_openrouter_rejects_paid_or_automatic_model_ids_before_http(self):
+        with patch.object(lesson, "urlopen") as call:
+            for model in ("openai/gpt-oss-20b", "openrouter/free"):
+                with self.assertRaisesRegex(ValueError, "exact OpenRouter text model"):
+                    lesson.openrouter_text("fake", model, "Write a script.")
+        call.assert_not_called()
+
     def test_quota_message_preserves_useful_fields_without_retrying(self):
         payloads = [
             ({"details": [{"retryDelay": "42.4s"}, {"violations": [
@@ -102,8 +148,9 @@ class LessonTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as problem:
                     lesson.gemini("fake-key", "audio", model=lesson.TTS_MODEL)
             message = str(problem.exception)
-            for expected in (limit, delay, lesson.TTS_MODEL, lesson.ALT_TTS_MODEL, "same --output"):
+            for expected in (limit, delay, lesson.TTS_MODEL, "same TTS model", "same --output"):
                 self.assertIn(expected, message)
+            self.assertNotIn(lesson.ALT_TTS_MODEL, message)
             self.assertNotIn("Private", message)
             self.assertNotIn("fake-key", message)
             self.assertEqual(request.call_count, 1)

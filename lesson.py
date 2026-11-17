@@ -20,6 +20,8 @@ import wave
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from tts_routes import TTSRoutes, is_key_env
+
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 FONT = ASSETS / "noto-sans-latin.ttf"
@@ -32,6 +34,7 @@ LANGUAGES = {
 LEVELS = ("A1", "A2", "B1", "B2", "C1", "C2")
 MODES = ("auto", "dialogue", "narration", "mixed")
 API = "https://generativelanguage.googleapis.com/v1beta/interactions"
+OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 TEXT_MODEL = "gemini-3.5-flash-lite"
 TTS_MODEL = "gemini-3.8-flash-lite-tts"
 ALT_TTS_MODEL = "gemini-3.8-flash-tts"
@@ -42,7 +45,8 @@ MAX_TURNS = 30
 
 
 def object_schema(**properties):
-    return {"type": "object", "properties": properties, "required": list(properties)}
+    return {"type": "object", "properties": properties, "required": list(properties),
+            "additionalProperties": False}
 
 
 SCHEMA = object_schema(
@@ -116,9 +120,7 @@ def gemini(key, kind, **body):
         elif exc.code == 429:
             hint = quota_hint(exc)
             if kind == "audio":
-                hint += " Resume with --script pointing to the saved script.json and the same --output."
-                if body["model"] == TTS_MODEL:
-                    hint += f" If it has quota, try --tts-model {ALT_TTS_MODEL}."
+                hint += " After quota resets, resume with the saved script.json, same --output, and same TTS model."
         else:
             hint = " Check model availability and the project's API settings."
         raise RuntimeError(f"Gemini {kind} request ({body['model']}) failed (HTTP {exc.code}).{hint}") from exc
@@ -136,7 +138,39 @@ def gemini(key, kind, **body):
     return blocks[-1]
 
 
-def write_story(topic, language, level, mode, count, key, model):
+def openrouter_text(key, model, prompt):
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+:free", model, re.ASCII):
+        raise ValueError("Choose an exact OpenRouter text model ID ending in :free.")
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "provider": {"require_parameters": True},
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "language_lesson", "strict": True, "schema": SCHEMA,
+        }},
+    }
+    request = Request(
+        OPENROUTER_API, data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            result = json.load(response)
+    except HTTPError as exc:
+        hint = quota_hint(exc) if exc.code == 429 else ""
+        raise RuntimeError(f"OpenRouter script request ({model}) failed (HTTP {exc.code}).{hint}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise RuntimeError("Could not reach OpenRouter to write the script.") from exc
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except (TypeError, KeyError, IndexError) as exc:
+        raise RuntimeError("OpenRouter returned no script. Check that the free model supports structured outputs.") from exc
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("OpenRouter returned an empty script.")
+    return content
+
+
+def write_story(topic, language, level, mode, count, key, model, *, openrouter=False):
     formats = {
         "auto": "Choose narration, dialogue, or a mix based on the topic.",
         "narration": "Every turn is spoken by martin alone.",
@@ -154,11 +188,14 @@ def write_story(topic, language, level, mode, count, key, model):
         "Write a short title, up to 64 characters. Give each turn a short delivery direction in English "
         "describing the appropriate emotion or tone, and a pause_ms of about 350 to 650."
     )
-    block = gemini(key, "text", model=model, input=prompt,
-                   response_format={"type": "text", "mime_type": "application/json", "schema": SCHEMA})
-    story = json.loads(block["text"])
+    if openrouter:
+        content = openrouter_text(key, model, prompt)
+    else:
+        content = gemini(key, "text", model=model, input=prompt,
+                         response_format={"type": "text", "mime_type": "application/json", "schema": SCHEMA})["text"]
+    story = json.loads(content)
     if not isinstance(story, dict):
-        raise ValueError("Gemini returned an invalid script.")
+        raise ValueError("The text model returned an invalid script.")
     story.update(language=language, level=level)
     validate_story(story)
     speakers = {turn["speaker"] for turn in story["turns"]}
@@ -224,7 +261,7 @@ def tone_wav(speaker):
     return stream.getvalue()
 
 
-def speech_track(story, folder, key, model):
+def speech_track(story, folder, key, model, *, routes=None):
     speakers = list(dict.fromkeys(turn["speaker"] for turn in story["turns"]))
     multi = len(speakers) == 2
     speech_config = {"speakers": [{"speaker": name, "voice": VOICES[name]} for name in speakers]} if multi else [
@@ -245,6 +282,8 @@ def speech_track(story, folder, key, model):
     path = folder / f"speech-{digest}.wav"
     if path.is_file():
         return path, read_pcm(path.read_bytes())
+    if routes is not None:
+        key = routes.reserve()
     print(f"Generating the whole lesson in one TTS request ({model}).", flush=True)
     block = gemini(key, "audio", **request)
     wav_bytes = base64.b64decode(block["data"], validate=True)
@@ -359,7 +398,7 @@ def srt_time(ms):
     return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
 
 
-def render(story, output, key=None, model=TTS_MODEL, demo=False):
+def render(story, output, key=None, model=TTS_MODEL, demo=False, *, routes=None):
     validate_story(story)
     output.mkdir(parents=True, exist_ok=True)
     (output / "script.json").write_text(json.dumps(story, ensure_ascii=False, indent=2) + "\n",
@@ -372,7 +411,7 @@ def render(story, output, key=None, model=TTS_MODEL, demo=False):
             import stable_whisper
         except ImportError as exc:
             raise RuntimeError('Install local alignment first: python -m pip install "stable-ts==2.19.1"') from exc
-        recording, pcm = speech_track(story, output, key, model)
+        recording, pcm = speech_track(story, output, key, model, routes=routes)
         intervals = align_speech(stable_whisper, recording, story, len(pcm) // 2)
         pcm, intervals = add_pauses(pcm, intervals, turns)
 
@@ -435,7 +474,7 @@ def render(story, output, key=None, model=TTS_MODEL, demo=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--topic", help="Ask Gemini to write the script from this topic.")
+    source.add_argument("--topic", help="Write a script from this topic.")
     source.add_argument("--script", type=Path, help="Render an existing JSON script.")
     parser.add_argument("--language", choices=LANGUAGES, default="de-DE")
     parser.add_argument("--level", choices=LEVELS, default="A1")
@@ -443,7 +482,14 @@ def main():
     parser.add_argument("--turns", type=int, choices=range(1, MAX_TURNS + 1), default=12, metavar="1-30",
                         help="Script length (default: 12). One TTS request for the full script.")
     parser.add_argument("--output", type=Path, default=Path("output"))
-    parser.add_argument("--text-model", default=TEXT_MODEL)
+    writers = parser.add_mutually_exclusive_group()
+    writers.add_argument("--text-model", default=TEXT_MODEL, help="Gemini model for writing the script.")
+    writers.add_argument("--openrouter-text-model", metavar="MODEL:free",
+                         help="Use an exact free OpenRouter model for script writing only.")
+    parser.add_argument("--gemini-key-env", default="GEMINI_API_KEY", metavar="NAME",
+                        help="Environment variable holding the Gemini key for this run (default: GEMINI_API_KEY).")
+    parser.add_argument("--tts-routes", type=Path, metavar="FILE",
+                        help="Use ordered Gemini project budgets for speech, from a JSON config.")
     parser.add_argument("--tts-model", default=TTS_MODEL,
                         help=f"Default: {TTS_MODEL}. Alternative: {ALT_TTS_MODEL}.")
     parser.add_argument("--demo", action="store_true", help="Use offline test tones with --script.")
@@ -452,17 +498,28 @@ def main():
         parser.error("--demo requires --script and never calls Gemini.")
     if args.topic is not None and not args.topic.strip():
         parser.error("--topic cannot be empty.")
+    if args.script and args.openrouter_text_model is not None:
+        parser.error("--openrouter-text-model only applies to --topic.")
     if args.topic and args.turns < 2 and args.mode in ("dialogue", "mixed"):
         parser.error("Dialogue and mixed mode need at least 2 turns.")
     if not shutil.which("ffmpeg"):
         parser.error("Install FFmpeg and put it on PATH.")
-    key = os.environ.get("GEMINI_API_KEY")
-    if not args.demo and not key:
-        parser.error("Set GEMINI_API_KEY in your environment, or use --demo with a script.")
+    if not is_key_env(args.gemini_key_env):
+        parser.error("--gemini-key-env must name a GEMINI_API_KEY, GOOGLE_API_KEY, or GOOGLE_AI_API_KEY variable.")
+    key = os.environ.get(args.gemini_key_env)
+    use_openrouter = args.openrouter_text_model is not None
+    if not args.demo and not key and (not args.tts_routes or (args.topic and not use_openrouter)):
+        parser.error(f"Set {args.gemini_key_env} for Gemini requests that do not use --tts-routes.")
+    writer_key = os.environ.get("OPENROUTER_API_KEY") if use_openrouter else key
+    if use_openrouter and not writer_key:
+        parser.error("Set OPENROUTER_API_KEY to use --openrouter-text-model.")
     try:
+        routes = TTSRoutes(args.tts_routes) if args.tts_routes and not args.demo else None
         story = (json.loads(args.script.read_text(encoding="utf-8-sig")) if args.script else
-                 write_story(args.topic, args.language, args.level, args.mode, args.turns, key, args.text_model))
-        target = render(story, args.output, key, args.tts_model, args.demo)
+                 write_story(args.topic, args.language, args.level, args.mode, args.turns,
+                             writer_key, args.openrouter_text_model if use_openrouter else args.text_model,
+                             openrouter=use_openrouter))
+        target = render(story, args.output, key, args.tts_model, args.demo, routes=routes)
     except (OSError, ValueError, RuntimeError, wave.Error, KeyError, EOFError,
             subprocess.CalledProcessError) as error:
         parser.exit(1, f"Error: {error}\n")
