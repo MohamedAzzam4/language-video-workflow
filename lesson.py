@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -33,6 +34,7 @@ MODES = ("auto", "dialogue", "narration", "mixed")
 API = "https://generativelanguage.googleapis.com/v1beta/interactions"
 TEXT_MODEL = "gemini-3.5-flash-lite"
 TTS_MODEL = "gemini-3.8-flash-lite-tts"
+ALT_TTS_MODEL = "gemini-3.8-flash-tts"
 WIDTH, HEIGHT, FPS, RATE = 1280, 720, 30, 24000
 SAMPLES_PER_FRAME = RATE // FPS
 TEXT_LIMIT = 120
@@ -54,6 +56,51 @@ SCHEMA = object_schema(
 )
 
 
+def quota_hint(error):
+    # Only show known quota fields, never the raw provider response or the request.
+    header = (error.headers or {}).get("Retry-After", "").strip()
+    with error:
+        raw = error.read(65536).decode("utf-8", errors="replace")
+    limits, delays = set(), []
+    if re.fullmatch(r"[0-9]{1,9}", header):
+        delays.append(int(header))
+    try:
+        body = json.loads(raw).get("error", {})
+        message, details = body.get("message", ""), body.get("details") or []
+    except (ValueError, AttributeError):
+        message, details = raw, []
+    for count, unit, period in re.findall(r"([0-9]+)\s+(requests?|tokens?) per (day|minute)", str(message), re.I):
+        limits.add(f"{count} {unit.lower()} per {period.lower()}")
+    for delay in re.findall(r"\bretry in ([0-9hms. ]{1,30}[hms])", str(message), re.I):
+        factors = {"h": 3600, "m": 60, "s": 1}
+        delays.append(math.ceil(sum(float(n) * factors[u] for n, u in
+                                    re.findall(r"([0-9]+(?:\.[0-9]+)?)\s*([hms])", delay.lower()))))
+    for detail in details if isinstance(details, list) else []:
+        if not isinstance(detail, dict):
+            continue
+        delay = str(detail.get("retryDelay", ""))
+        if re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9})?s", delay):
+            delays.append(math.ceil(float(delay[:-1])))
+        violations = detail.get("violations")
+        for item in violations if isinstance(violations, list) else []:
+            if not isinstance(item, dict):
+                continue
+            period = re.search(r"per[_ -]*(day|minute)", str(item.get("quotaId", "")), re.I)
+            count = str(item.get("quotaValue", ""))
+            if period and re.fullmatch(r"[0-9]{1,12}", count):
+                unit = "tokens" if "token" in str(item.get("quotaMetric", "")).lower() else "requests"
+                limits.add(f"{count} {unit} per {period[1].lower()}")
+    hint = " Quota or rate limit reached."
+    if limits:
+        hint += f" Reported limit: {', '.join(sorted(limits))}."
+    if delays:
+        hours, rest = divmod(max(delays), 3600)
+        minutes, seconds = divmod(rest, 60)
+        delay = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+        hint += f" Retry in {delay}."
+    return hint
+
+
 def gemini(key, kind, **body):
     request = Request(
         API, data=json.dumps({"store": False, **body}).encode("utf-8"),
@@ -67,10 +114,14 @@ def gemini(key, kind, **body):
         if exc.code in (401, 403):
             hint = " Check the key and its Gemini Developer API access."
         elif exc.code == 429:
-            hint = " Quota or rate limit reached. Wait and resume using the saved script."
+            hint = quota_hint(exc)
+            if kind == "audio":
+                hint += " Resume with --script pointing to the saved script.json and the same --output."
+                if body["model"] == TTS_MODEL:
+                    hint += f" If it has quota, try --tts-model {ALT_TTS_MODEL}."
         else:
             hint = " Check model availability and the project's API settings."
-        raise RuntimeError(f"Gemini {kind} request failed (HTTP {exc.code}).{hint}") from exc
+        raise RuntimeError(f"Gemini {kind} request ({body['model']}) failed (HTTP {exc.code}).{hint}") from exc
     except (URLError, TimeoutError) as exc:
         raise RuntimeError("Could not reach Gemini. Check the network and retry.") from exc
     blocks = [
@@ -89,14 +140,15 @@ def write_story(topic, language, level, mode, count, key, model):
     formats = {
         "auto": "Choose narration, dialogue, or a mix based on the topic.",
         "narration": "Every turn is spoken by martin alone.",
-        "dialogue": "Use two or three of anna, ben, and maya. Do not use martin.",
-        "mixed": "Use martin for narration and at least two other people for dialogue.",
+        "dialogue": "Use exactly two of anna, ben, and maya. Do not use martin.",
+        "mixed": "Use martin for narration and exactly one other character for spoken lines.",
     }
     prompt = (
         f"Write a short, coherent {level} CEFR language-learning story in {LANGUAGES[language]}. "
         f"Topic: {json.dumps(topic, ensure_ascii=False)}. {formats[mode]} "
         f"Make exactly {count} speaking turns. Use natural everyday spoken language. "
         "For A1/A2, favor high-frequency vocabulary, short sentences, and concrete situations. "
+        "Use at most two distinct speakers in the whole story. "
         "Use martin only as narrator, and anna, ben, or maya as dialogue characters. "
         f"Each spoken turn is at most {TEXT_LIMIT} characters. No speaker names, markup, or directions in text. "
         "Write a short title, up to 64 characters. Give each turn a short delivery direction in English "
@@ -114,8 +166,8 @@ def write_story(topic, language, level, mode, count, key, model):
     mode_ok = {
         "auto": True,
         "narration": speakers == {"martin"},
-        "dialogue": "martin" not in speakers and len(others) >= 2,
-        "mixed": "martin" in speakers and len(others) >= 2,
+        "dialogue": "martin" not in speakers and len(others) == 2,
+        "mixed": "martin" in speakers and len(others) == 1,
     }
     if len(story["turns"]) != count or not mode_ok[mode]:
         raise ValueError("Generated story did not match the requested format or turn count. Try again.")
@@ -144,6 +196,8 @@ def validate_story(story):
         pause = turn.get("pause_ms", 400)
         if type(pause) is not int or not 0 <= pause <= 3000:
             raise ValueError(f"Turn {number}: pause_ms must be an integer between 0 and 3000.")
+    if len({turn["speaker"] for turn in turns}) > 2:
+        raise ValueError("One Gemini TTS request supports at most two speakers. Use one or two for this lesson.")
 
 
 def read_pcm(wav_bytes):
@@ -170,32 +224,92 @@ def tone_wav(speaker):
     return stream.getvalue()
 
 
-def speech_clip(turn, language, level, folder, key, model, demo):
-    voice = VOICES[turn["speaker"]]
-    pace = "an unhurried pace with clear articulation" if level in ("A1", "A2") else "a natural pace"
-    style = f"{turn['delivery'].strip()}. Use {LANGUAGES[language]} and {pace}."
-    cache_key = json.dumps([model, voice, style, turn["text"]], ensure_ascii=False)
-    prefix = "demo" if demo else "tts"
-    path = folder / f"{prefix}-{hashlib.sha256(cache_key.encode()).hexdigest()[:24]}.wav"
+def speech_track(story, folder, key, model):
+    speakers = list(dict.fromkeys(turn["speaker"] for turn in story["turns"]))
+    multi = len(speakers) == 2
+    speech_config = {"speakers": [{"speaker": name, "voice": VOICES[name]} for name in speakers]} if multi else [
+        {"voice": VOICES[speakers[0]]}
+    ]
+    language = LANGUAGES[story["language"]]
+    pace = "unhurried, clearly articulated" if story["level"] in ("A1", "A2") else "natural pace"
+    content = []
+    for turn in story["turns"]:
+        tag = {"type": "speech_metadata", "style": f"{turn['delivery'].strip()}, {language}, {pace}"}
+        if multi:
+            tag["speaker"] = turn["speaker"]
+        content.append({"type": "text", "text": turn["text"].strip(), "annotations": [tag]})
+    request = {"model": model, "response_format": {"type": "audio"},
+               "generation_config": {"speech_config": speech_config},
+               "input": [{"type": "user_input", "content": content}]}
+    digest = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    path = folder / f"speech-{digest}.wav"
     if path.is_file():
-        return read_pcm(path.read_bytes())
-    if demo:
-        wav_bytes = tone_wav(turn["speaker"])
-    else:
-        block = gemini(
-            key, "audio", model=model, response_format={"type": "audio"},
-            generation_config={"speech_config": [{"voice": voice}]},
-            input=[{"type": "user_input", "content": [{
-                "type": "text", "text": turn["text"].strip(),
-                "annotations": [{"type": "speech_metadata", "style": style}],
-            }]}],
-        )
-        wav_bytes = base64.b64decode(block["data"], validate=True)
+        return path, read_pcm(path.read_bytes())
+    print(f"Generating the whole lesson in one TTS request ({model}).", flush=True)
+    block = gemini(key, "audio", **request)
+    wav_bytes = base64.b64decode(block["data"], validate=True)
     pcm = read_pcm(wav_bytes)
     partial = path.with_suffix(".tmp")
     partial.write_bytes(wav_bytes)
     partial.replace(path)
-    return pcm
+    return path, pcm
+
+
+def demo_track(turns):
+    pcm, intervals = bytearray(), []
+    for turn in turns:
+        start = len(pcm) // 2
+        pcm.extend(read_pcm(tone_wav(turn["speaker"])))
+        end = len(pcm) // 2
+        intervals.append((start, end))
+        next_start = video_frame(end + turn.get("pause_ms", 400) * RATE // 1000) * SAMPLES_PER_FRAME
+        pcm.extend(bytes(2 * (next_start - end)))
+    return bytes(pcm), intervals
+
+
+def align_speech(whisper, path, story, samples):
+    transcript = "\n".join(turn["text"].strip() for turn in story["turns"])
+    print("Aligning captions locally (first run may download Whisper base).", flush=True)
+    result = whisper.load_model("base", device="cpu").align(
+        str(path), transcript, language=story["language"].split("-")[0],
+        original_split=True, failure_threshold=0.25, verbose=None,
+    )
+    hint = f"Could not align all script turns to {path.name}. The WAV is cached; inspect it before regenerating."
+    if result is None or len(result.segments) != len(story["turns"]):
+        raise ValueError(hint)
+    intervals, previous_end = [], 0
+    for segment in result.segments:
+        if not all(math.isfinite(t) for t in (segment.start, segment.end)):
+            raise ValueError(hint)
+        start, end = round(segment.start * RATE), min(samples, round(segment.end * RATE))
+        if start < previous_end - RATE // 10 or end - max(previous_end, start) < SAMPLES_PER_FRAME:
+            raise ValueError(hint)
+        intervals.append((max(previous_end, start), end))
+        previous_end = end
+    return intervals
+
+
+def add_pauses(pcm, intervals, turns):
+    """Keep the original recording and add silence only where a requested pause is longer."""
+    starts = [start for start, _ in intervals[1:]] + [len(pcm) // 2]
+    output, adjusted = bytearray(), []
+    cursor = offset = 0
+    for (start, end), next_start, turn in zip(intervals, starts, turns):
+        adjusted.append((start + offset, end + offset))
+        gap = next_start - end
+        extra = max(0, turn.get("pause_ms", 400) * RATE // 1000 - gap)
+        if extra:
+            cut = end + gap // 2
+            output.extend(pcm[cursor * 2:cut * 2])
+            output.extend(bytes(extra * 2))
+            cursor = cut
+            offset += extra
+    output.extend(pcm[cursor * 2:])
+    return bytes(output), adjusted
+
+
+def video_frame(sample):
+    return (sample + SAMPLES_PER_FRAME - 1) // SAMPLES_PER_FRAME
 
 
 def make_card(background, portraits, story, speakers, speaker=None, caption=None):
@@ -248,46 +362,53 @@ def srt_time(ms):
 def render(story, output, key=None, model=TTS_MODEL, demo=False):
     validate_story(story)
     output.mkdir(parents=True, exist_ok=True)
-    clips = output / "clips"
-    clips.mkdir(exist_ok=True)
     (output / "script.json").write_text(json.dumps(story, ensure_ascii=False, indent=2) + "\n",
                                         encoding="utf-8")
-    speakers = [name for name in VOICES if any(t["speaker"] == name for t in story["turns"])]
+    turns = story["turns"]
+    if demo:
+        pcm, intervals = demo_track(turns)
+    else:
+        try:
+            import stable_whisper
+        except ImportError as exc:
+            raise RuntimeError('Install local alignment first: python -m pip install "stable-ts==2.19.1"') from exc
+        recording, pcm = speech_track(story, output, key, model)
+        intervals = align_speech(stable_whisper, recording, story, len(pcm) // 2)
+        pcm, intervals = add_pauses(pcm, intervals, turns)
+
+    speakers = [name for name in VOICES if any(t["speaker"] == name for t in turns)]
     background = Image.open(ASSETS / "warm-background.webp").convert("RGB")
     portraits = {name: Image.open(ASSETS / f"{name}.webp").convert("RGBA") for name in speakers}
     sections, subtitles, timeline = [], [], []
-    frame = 0
+    total_frames = video_frame(len(pcm) // 2)
     with tempfile.TemporaryDirectory(prefix=".render-", dir=output) as temporary:
         temp = Path(temporary)
         with wave.open(str(temp / "audio.wav"), "wb") as track:
             track.setparams((1, 2, RATE, 0, "NONE", "not compressed"))
-            for number, turn in enumerate(story["turns"], 1):
-                print(f"Turn {number}/{len(story['turns'])} · {turn['speaker']}", flush=True)
-                pcm = speech_clip(turn, story["language"], story["level"], clips, key, model, demo)
-                speech_samples = len(pcm) // 2
-                on = (speech_samples + SAMPLES_PER_FRAME - 1) // SAMPLES_PER_FRAME
-                pause_samples = turn.get("pause_ms", 400) * RATE // 1000
-                span = (speech_samples + pause_samples + SAMPLES_PER_FRAME - 1) // SAMPLES_PER_FRAME
-                track.writeframesraw(pcm)
-                track.writeframesraw(bytes(2 * (span * SAMPLES_PER_FRAME - speech_samples)))
+            track.writeframesraw(pcm)
+            track.writeframes(bytes(2 * total_frames * SAMPLES_PER_FRAME - len(pcm)))
 
-                # ponytail: whole-turn stills; add animation only if the pilot needs it.
-                still = f"{number:03}.png"
-                make_card(background, portraits, story, speakers, turn["speaker"], turn["text"]).save(temp / still)
-                sections.append((still, on))
-                if span > on:
-                    silent = f"{number:03}-pause.png"
-                    make_card(background, portraits, story, speakers,
-                              "martin" if turn["speaker"] == "martin" else None).save(temp / silent)
-                    sections.append((silent, span - on))
+        def section(filename, frames, speaker=None, caption=None):
+            if frames > 0:
+                make_card(background, portraits, story, speakers, speaker, caption).save(temp / filename)
+                sections.append((filename, frames))
 
-                start_ms = round(frame * 1000 / FPS)
-                end_ms = max(start_ms + 1, round((frame * SAMPLES_PER_FRAME + speech_samples) * 1000 / RATE))
-                subtitles.append(f"{number}\n{srt_time(start_ms)} --> {srt_time(end_ms)}\n{turn['text']}")
-                timeline.append({"speaker": turn["speaker"], "text": turn["text"],
-                                 "start_ms": start_ms, "end_ms": end_ms,
-                                 "start_frame": frame, "next_frame": frame + span})
-                frame += span
+        if intervals[0][0]:
+            section("lead-in.png", video_frame(intervals[0][0]), turns[0]["speaker"])
+        for index, (turn, (start, end)) in enumerate(zip(turns, intervals)):
+            number = index + 1
+            speaker, caption = turn["speaker"], turn["text"]
+            print(f"Turn {number}/{len(turns)} - {speaker}", flush=True)
+            start_frame, end_frame = video_frame(start), video_frame(end)
+            next_frame = video_frame(intervals[number][0]) if number < len(turns) else total_frames
+            # ponytail: whole-turn stills; add animation only if the pilot needs it.
+            section(f"{number:03}.png", end_frame - start_frame, speaker, caption)
+            section(f"{number:03}-pause.png", next_frame - end_frame, speaker)
+            start_ms, end_ms = round(start * 1000 / RATE), round(end * 1000 / RATE)
+            subtitles.append(f"{number}\n{srt_time(start_ms)} --> {srt_time(end_ms)}\n{caption}")
+            timeline.append({"speaker": speaker, "text": caption,
+                             "start_ms": start_ms, "end_ms": end_ms,
+                             "start_frame": start_frame, "next_frame": next_frame})
 
         last = sections[-1][0]
         concat = "ffconcat version 1.0\n" + "".join(
@@ -298,7 +419,7 @@ def render(story, output, key=None, model=TTS_MODEL, demo=False):
         subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
              "-f", "concat", "-safe", "0", "-i", "frames.ffconcat", "-i", "audio.wav",
-             "-vf", f"fps={FPS}", "-t", f"{frame / FPS:.9f}",
+             "-vf", f"fps={FPS}", "-t", f"{total_frames / FPS:.9f}",
              "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-movflags", "+faststart", "video.mp4"],
             cwd=temp, check=True,
@@ -319,25 +440,27 @@ def main():
     parser.add_argument("--language", choices=LANGUAGES, default="de-DE")
     parser.add_argument("--level", choices=LEVELS, default="A1")
     parser.add_argument("--mode", choices=MODES, default="auto")
-    parser.add_argument("--turns", type=int, choices=range(1, MAX_TURNS + 1), default=12, metavar="1–30")
+    parser.add_argument("--turns", type=int, choices=range(1, MAX_TURNS + 1), default=12, metavar="1-30",
+                        help="Script length (default: 12). One TTS request for the full script.")
     parser.add_argument("--output", type=Path, default=Path("output"))
     parser.add_argument("--text-model", default=TEXT_MODEL)
-    parser.add_argument("--tts-model", default=TTS_MODEL)
+    parser.add_argument("--tts-model", default=TTS_MODEL,
+                        help=f"Default: {TTS_MODEL}. Alternative: {ALT_TTS_MODEL}.")
     parser.add_argument("--demo", action="store_true", help="Use offline test tones with --script.")
     args = parser.parse_args()
     if args.demo and not args.script:
         parser.error("--demo requires --script and never calls Gemini.")
     if args.topic is not None and not args.topic.strip():
         parser.error("--topic cannot be empty.")
-    if args.topic and args.turns < {"dialogue": 2, "mixed": 3}.get(args.mode, 1):
-        parser.error("Dialogue needs at least 2 turns, and mixed needs at least 3.")
+    if args.topic and args.turns < 2 and args.mode in ("dialogue", "mixed"):
+        parser.error("Dialogue and mixed mode need at least 2 turns.")
     if not shutil.which("ffmpeg"):
         parser.error("Install FFmpeg and put it on PATH.")
     key = os.environ.get("GEMINI_API_KEY")
     if not args.demo and not key:
         parser.error("Set GEMINI_API_KEY in your environment, or use --demo with a script.")
     try:
-        story = (json.loads(args.script.read_text(encoding="utf-8")) if args.script else
+        story = (json.loads(args.script.read_text(encoding="utf-8-sig")) if args.script else
                  write_story(args.topic, args.language, args.level, args.mode, args.turns, key, args.text_model))
         target = render(story, args.output, key, args.tts_model, args.demo)
     except (OSError, ValueError, RuntimeError, wave.Error, KeyError, EOFError,

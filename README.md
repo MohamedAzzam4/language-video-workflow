@@ -5,8 +5,8 @@ Make a language-learning video from a topic or an existing script. Python runs t
 ## Implementation plan
 
 1. Use Gemini to write a short story at the requested CEFR level, or load an existing JSON script. Validate the text, speaker IDs, and delivery directions.
-2. Assign fixed voices and portraits to Anna, Ben, Maya, and Martin. Ask Gemini TTS to perform one turn at a time, passing delivery instructions separately from the spoken text. Save and reuse identical WAV clips.
-3. Derive one timeline from the exact audio sample counts. Concatenate speech and pauses, highlight the active portrait, and show its caption over the same warm background in every video.
+2. Assign fixed voices and portraits to Anna, Ben, Maya, and Martin. Send **the entire lesson in one Gemini TTS request**, with delivery instructions for each turn. Cache the returned WAV.
+3. Align the original script turns to the recording locally with Whisper. Keep the recorded speech and add silence only where a requested `pause_ms` is longer than the natural gap. Use the resulting timeline for the active portrait and caption.
 4. Export an MP4 with burned-in captions, a separate SRT, and the audio and timings for reuse. Verify the renderer offline before running a real voice test.
 
 ## Run
@@ -19,7 +19,14 @@ python -m pip install -r requirements.txt
 python lesson.py --script example.json --demo --output output/demo
 ```
 
-For real speech, set `GEMINI_API_KEY` in your shell or runtime secrets. One [Google AI Studio API key](https://aistudio.google.com/apikey) is enough for writing and speech. Don't put the key in the repo.
+For real speech, install the local aligner in the same Python environment. These CPU wheels avoid a CUDA installation on Windows and Linux.
+
+```sh
+python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+python -m pip install "stable-ts==2.19.1"
+```
+
+The first real render downloads the multilingual Whisper `base` model. Alignment then runs locally and does not use another API request. Set `GEMINI_API_KEY` in your shell or runtime secrets. One [Google AI Studio API key](https://aistudio.google.com/apikey) is enough for writing and speech. Don't put the key in the repo.
 
 ```sh
 # Test real TTS without a separate story-writing request.
@@ -32,9 +39,11 @@ python lesson.py --topic "Buying a train ticket" --language de-DE --level A1 --m
 python lesson.py --topic "A lost dog finds its way home" --language en-US --level A2 --mode narration --output output/dog
 ```
 
-`--language` accepts `de-DE`, `en-US`, and `es-ES`. `--level` accepts A1–C2. `--mode` can be `auto`, `dialogue`, `narration`, or `mixed`. Use `--turns` to choose the number of speaking turns when generating a story. The default models are Gemini 3.5 Flash-Lite for writing and Gemini 3.8 Flash-Lite TTS for speech. Try `--tts-model gemini-3.8-flash-tts` for comparison if your key has access.
+`--language` accepts `de-DE`, `en-US`, and `es-ES`. `--level` accepts A1–C2. `--mode` can be `auto`, `dialogue`, `narration`, or `mixed` (Martin plus one character). The default 12 speaking turns still cost one TTS request. A topic adds a separate writing request. [Gemini supports at most two voices in one multi-speaker request](https://ai.google.dev/gemini-api/docs/speech-generation#limitations), so scripts with a third speaker are rejected before TTS.
 
-The output folder contains `video.mp4`, `audio.wav`, `subtitles.srt`, `script.json`, `timeline.json`, and individual WAVs in `clips/`. To resume after an API limit or fix one take, edit or reuse the saved script and run with `--script path/to/script.json` and the **same** output folder. Unchanged lines are cached. Timing is rounded up by less than one video frame between turns.
+The default models are Gemini 3.5 Flash-Lite for writing and Gemini 3.8 Flash-Lite TTS for speech. If you hit a 429, the error shows the model and any reported limit or retry delay. The script does not retry automatically. Check your [active Google AI Studio limits](https://ai.google.dev/gemini-api/docs/rate-limits), or explicitly use `--tts-model gemini-3.8-flash-tts` if that model still has quota.
+
+The output folder contains `video.mp4`, `audio.wav`, `subtitles.srt`, `script.json`, `timeline.json`, and a cached original `speech-*.wav`. To resume, run with `--script path/to/script.json`, the **same output folder**, and the **same TTS model**. A matching cached WAV costs no new TTS request. Changing the spoken text, voices, or delivery regenerates the whole take. Old per-turn `clips/` caches are not reused by the new path. JSON input supports UTF-8 with or without a BOM. Script output is always UTF-8 without a BOM.
 
 Portraits and the reusable backdrop are in `assets/`. The renderer uses still portraits with speaker highlights. It doesn't generate new imagery for each topic.
 
@@ -44,4 +53,4 @@ Portraits and the reusable backdrop are in `assets/`. The renderer uses still po
 python -m unittest -v
 ```
 
-The tests need FFmpeg and ffprobe. They check timing, captions, speaker changes, the TTS request structure, and caching without sending API requests.
+The tests need FFmpeg and ffprobe. They check video timing, speaker changes, accented captions, Windows JSON compatibility, one-request TTS payloads, caching, and quota errors without sending API requests.
